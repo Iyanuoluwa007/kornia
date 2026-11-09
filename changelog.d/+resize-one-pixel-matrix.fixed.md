@@ -1,0 +1,1 @@
+`Resize`, `LongestMaxSize` and `SmallestMaxSize` with `align_corners=True` no longer return an all-NaN `transform_matrix` and an all-NaN `inverse` when the input or the output has a one-pixel axis. The matrix is now a translation along that axis, as in `RandomResizedCrop`. Sizes with every axis longer than one pixel are unchanged.

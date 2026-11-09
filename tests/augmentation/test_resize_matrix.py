@@ -105,6 +105,56 @@ class TestResizeMatrix(BaseTester):
         self.assert_close(aug.transform_matrix, expected.expand(2, -1, -1))
         self.assert_close(out, torch.nn.functional.interpolate(image, size, mode="bilinear", align_corners=False))
 
+    @pytest.mark.parametrize(
+        "shape,size",
+        [((6, 7), (1, 4)), ((6, 7), (4, 1)), ((6, 7), (1, 1)), ((1, 8), (4, 8)), ((6, 1), (4, 8)), ((1, 1), (4, 8))],
+    )
+    @pytest.mark.parametrize("resample", ["bilinear", "bicubic"])
+    def test_one_pixel_axis_matrix_is_a_translation_6644(self, device, dtype, shape, size, resample):
+        image = self._ramp(*shape, device, dtype) + 1
+        aug = K.Resize(size, resample=resample, align_corners=True)
+        out = aug(image)
+        h, w = shape
+        sx = 1.0 if 1 in (w, size[1]) else (size[1] - 1) / (w - 1)
+        sy = 1.0 if 1 in (h, size[0]) else (size[0] - 1) / (h - 1)
+        expected = image.new_tensor([[sx, 0, 0], [0, sy, 0], [0, 0, 1]])
+        self.assert_close(aug.transform_matrix, expected.expand(2, -1, -1))
+        inverse = aug.inverse(out)
+        assert inverse.shape[-2:] == shape
+        assert inverse.isfinite().all()
+        self.assert_close(inverse[..., 0, 0], image[..., 0, 0])
+
+    def test_one_pixel_output_inverse_returns_the_sampled_row_6644(self, device, dtype):
+        # A one-row output holds only row 0 of the input, so the inverse restores that row and leaves the rest empty.
+        image = self._ramp(6, 7, device, dtype) + 1
+        aug = K.Resize((1, 7), align_corners=True)
+        inverse = aug.inverse(aug(image))
+        self.assert_close(inverse[..., 0, :], image[..., 0, :])
+        self.assert_close(inverse[..., 1:, :], torch.zeros_like(inverse[..., 1:, :]))
+
+    @pytest.mark.parametrize("make", [lambda: K.LongestMaxSize(1), lambda: K.SmallestMaxSize(1)])
+    def test_one_pixel_max_size_matrix_is_finite_6644(self, device, dtype, make):
+        image = torch.rand(2, 3, 5, 5, device=device, dtype=dtype)
+        aug = make()
+        out = aug(image)
+        assert out.shape[-2:] == (1, 1)
+        self.assert_close(aug.transform_matrix, torch.eye(3, device=device, dtype=dtype).expand(2, -1, -1))
+
+    def test_one_pixel_output_keeps_keypoints_finite_6644(self, device, dtype):
+        image = torch.rand(1, 3, 6, 7, device=device, dtype=dtype)
+        keypoints = image.new_tensor([[[0.0, 0.0], [6.0, 5.0]]])
+        _, out = K.AugmentationSequential(K.Resize((1, 4)), data_keys=["input", "keypoints"])(image, keypoints)
+        self.assert_close(out, image.new_tensor([[[0.0, 0.0], [3.0, 5.0]]]))
+
+    @pytest.mark.parametrize("shape,size", [((5, 7), (3, 4)), ((2, 2), (9, 9)), ((9, 12), (2, 2))])
+    def test_longer_axes_keep_the_solved_matrix_6644(self, device, dtype, shape, size):
+        image = torch.rand(2, 3, *shape, device=device, dtype=dtype)
+        aug = K.Resize(size, align_corners=True)
+        params = aug.forward_parameters(image.shape)
+        aug(image, params=params)
+        solved = get_perspective_transform(params["src"], params["dst"]).to(device, dtype)
+        self.assert_close(aug.transform_matrix, solved, atol=0, rtol=0)
+
     @pytest.mark.parametrize("kind", ["resize", "longest", "smallest", "crop"])
     def test_sequential_annotations_follow_pixels_4804(self, device, dtype, kind):
         image = self._ramp(8, 12, device, dtype)

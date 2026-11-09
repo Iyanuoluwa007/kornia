@@ -22,11 +22,13 @@ import torch
 from kornia.augmentation import random_generator as rg
 from kornia.augmentation._2d.base import _input_metadata_only
 from kornia.augmentation._2d.geometric.base import GeometricAugmentationBase2D
+from kornia.augmentation._2d.geometric.resized_crop import _one_pixel_axes
 from kornia.constants import Resample
 from kornia.core.utils import _to_device_nonblocking, is_compiling
 from kornia.geometry.transform import crop_by_transform_mat, get_perspective_transform, resize
-from kornia.geometry.transform._crop import _half_pixel_resize_transform
+from kornia.geometry.transform._crop import _corner_aligned_resize_transform, _half_pixel_resize_transform
 from kornia.geometry.transform.affwarp import _side_to_image_size
+from kornia.geometry.transform.crop2d import _crop_inverse_by_transform_mat
 
 
 class Resize(GeometricAugmentationBase2D):
@@ -54,8 +56,10 @@ class Resize(GeometricAugmentationBase2D):
         This class uses :func:`kornia.geometry.transform.resize`; ``align_corners`` is forwarded for bilinear and
         bicubic sampling, and ``transform_matrix`` follows the grid they sample: at ``align_corners=False`` it is
         the half-pixel map ``x' = (x + 0.5) * W_out / W_in - 0.5`` (likewise for ``y``), and at ``True`` it maps
-        the corner pixel centers onto each other. Nearest sampling uses the half-pixel grid and PyTorch's
-        ``nearest-exact`` interpolation.
+        the corner pixel centers onto each other. Corner alignment has no scale along an axis where the input or the
+        output is one pixel, since the resize samples only the first input pixel there; ``transform_matrix`` is a
+        translation along that axis, which sends the first pixel onto output pixel 0 and stays invertible. Nearest
+        sampling uses the half-pixel grid and PyTorch's ``nearest-exact`` interpolation.
         ``inverse()`` resamples to the prior canvas and cannot recover values discarded by a resize.
 
     See Also:
@@ -104,10 +108,14 @@ class Resize(GeometricAugmentationBase2D):
         # graph-broke torch.compile (a Python ``if`` on a would-be tensor). Dropped; the
         # perspective transform below already yields identity when src == dst, so behaviour is
         # byte-identical.
-        transform: torch.Tensor = _to_device_nonblocking(
-            get_perspective_transform(params["src"], params["dst"]), input.device, input.dtype
-        )
-        return transform.expand(input.shape[0], -1, -1)
+        src, dst = params["src"], params["dst"]
+        transform: torch.Tensor = get_perspective_transform(src, dst)
+        # A one-pixel input or output axis makes the box vertices collinear, and the solve returns NaN. Corner-aligned
+        # resizing samples the first pixel along that axis, which the extent matrix encodes; every other size keeps the
+        # solved matrix bit for bit.
+        one_pixel = (_one_pixel_axes(src, src.device) | _one_pixel_axes(dst, src.device)).any(-1)
+        transform = torch.where(one_pixel[:, None, None], _corner_aligned_resize_transform(src, dst), transform)
+        return _to_device_nonblocking(transform, input.device, input.dtype).expand(input.shape[0], -1, -1)
 
     def apply_transform(
         self,
@@ -158,6 +166,9 @@ class Resize(GeometricAugmentationBase2D):
             # ``grid_sample`` only supports legacy ``nearest``. The forward path uses
             # ``nearest-exact``, so invert a resize with the same interpolation rule.
             return resize(input, size, interpolation="nearest-exact")
+
+        if flags["align_corners"]:
+            return _crop_inverse_by_transform_mat(input, transform, size, flags["resample"].name.lower(), "zeros", True)
 
         return crop_by_transform_mat(
             input,
